@@ -60,8 +60,8 @@ jobs:
         run: |
           pip install pillow
           python3 - <<'PY'
-          import io, json, os, re, sys, urllib.request
-          from urllib.parse import urlparse
+          import html, io, json, os, re, sys, urllib.request
+          from urllib.parse import urlparse, urljoin
           from xml.sax.saxutils import escape
           from PIL import Image, ImageDraw, ImageFont
 
@@ -454,30 +454,74 @@ jobs:
           w(root + "/app/src/main/java/" + pkg_path + "/MainActivity.java", java)
 
           # ---------- Logo -> launcher icons ----------
-          def fetch(u):
-              req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+          def fetch(u, referer=None):
+              h = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
+                   "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8"}
+              if referer:
+                  h["Referer"] = referer
+              req = urllib.request.Request(u, headers=h)
               with urllib.request.urlopen(req, timeout=30) as r:
                   return r.read()
 
-          def load_logo():
-              sources = []
-              if logo_url:
-                  sources.append(("url", logo_url))
-              for f in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp"):
-                  if os.path.exists(f):
-                      sources.append(("file", f))
-              sources.append(("url", "https://www.google.com/s2/favicons?domain=" + host + "&sz=256"))
-              for kind, val in sources:
-                  try:
-                      data = fetch(val) if kind == "url" else open(val, "rb").read()
-                      im = Image.open(io.BytesIO(data))
+          def direct(u):
+              m = re.search(r"drive\.google\.com/file/d/([\w-]+)", u) or re.search(r"drive\.google\.com/open\?id=([\w-]+)", u)
+              if m:
+                  return "https://drive.google.com/uc?export=download&id=" + m.group(1)
+              if "dropbox.com" in u:
+                  return u.replace("dl=0", "dl=1")
+              return u
+
+          def to_image(data, src):
+              try:
+                  im = Image.open(io.BytesIO(data))
+                  im.load()
+                  return im.convert("RGBA")
+              except Exception:
+                  pass
+              text = data[:400000].decode("utf-8", "ignore")
+              pats = [r"""<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)""",
+                      r"""<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|twitter:image)["']"""]
+              for pat in pats:
+                  m = re.search(pat, text, re.I)
+                  if m:
+                      img_url = urljoin(src, html.unescape(m.group(1)))
+                      im = Image.open(io.BytesIO(fetch(img_url, src)))
                       im.load()
-                      print("Logo mila:", val)
+                      print("Web page se asli image link mila:", img_url)
+                      return im.convert("RGBA")
+              raise ValueError("ye image nahi, web page hai (direct image link chahiye)")
+
+          def load_logo():
+              if logo_url:
+                  u = direct(logo_url)
+                  try:
+                      im = to_image(fetch(u, "https://" + (urlparse(u).hostname or "") + "/"), u)
+                      print("Logo mila (link se):", u)
+                      return im
+                  except Exception as e:
+                      msg = "Logo link se image nahi mili (%s). Link: %s . Direct image link dein ya logo field khali chhod kar image repo mein upload karein." % (e, logo_url)
+                      print("::error::" + msg)
+                      sys.exit(1)
+              exts = (".png", ".jpg", ".jpeg", ".webp")
+              files = [f for f in os.listdir(".") if os.path.isfile(f) and f.lower().endswith(exts)]
+              files.sort(key=lambda f: (not f.lower().startswith("logo"), f.lower()))
+              for f in files:
+                  try:
+                      im = Image.open(f)
+                      im.load()
+                      print("Logo mila (repo file):", f)
                       return im.convert("RGBA")
                   except Exception as e:
-                      print("Logo nahi mila:", val, "->", e)
+                      print("Repo file image nahi:", f, "->", e)
+              try:
+                  im = Image.open(io.BytesIO(fetch("https://www.google.com/s2/favicons?domain=" + host + "&sz=256")))
+                  im.load()
+                  print("Logo mila (website favicon)")
+                  return im.convert("RGBA")
+              except Exception as e:
+                  print("Favicon nahi mila ->", e)
+              print("::warning::Logo nahi mila, isliye simple letter wala icon bana diya")
               return None
-
           def placeholder():
               im = Image.new("RGBA", (512, 512), (26, 115, 232, 255))
               d = ImageDraw.Draw(im)
@@ -491,22 +535,35 @@ jobs:
                   d.text((200, 200), app_name[0].upper(), fill="white", font=font)
               return im
 
-          def make_icon(logo, size):
+          def is_fullbleed(im):
+              w, h = im.size
+              if w < 8 or h < 8 or not 0.8 <= w / h <= 1.25:
+                  return False
+              for x, y in [(w // 2, 1), (w // 2, h - 2), (1, h // 2), (w - 2, h // 2)]:
+                  r, g, b, a = im.getpixel((x, y))
+                  if a < 250 or min(r, g, b) > 235:
+                      return False
+              return True
+
+          def make_icon(logo, size, full):
               out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
               mask = Image.new("L", (size, size), 0)
               ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=int(size * 0.22), fill=255)
+              if full:
+                  out.paste(logo.resize((size, size), Image.LANCZOS), (0, 0), mask)
+                  return out
               out.paste(Image.new("RGBA", (size, size), (255, 255, 255, 255)), (0, 0), mask)
               inner = int(size * 0.72)
               ratio = min(inner / logo.width, inner / logo.height)
               l = logo.resize((max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))), Image.LANCZOS)
               out.alpha_composite(l, ((size - l.width) // 2, (size - l.height) // 2))
               return out
-
           logo = load_logo() or placeholder()
+          full = is_fullbleed(logo)
           for density, size in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
               d = res + "/mipmap-" + density
               os.makedirs(d, exist_ok=True)
-              make_icon(logo, size).save(d + "/ic_launcher.png")
+              make_icon(logo, size, full).save(d + "/ic_launcher.png")
 
           env_file = os.environ.get("GITHUB_ENV")
           if env_file:
