@@ -19,6 +19,15 @@ on:
         description: "Package name (optional, e.g. com.myshop.app)"
         required: false
         type: string
+      offline_mode:
+        description: "Offline mode: website APK ke andar bundle hogi, internet ki zarurat nahi (calculator jaisi single-page apps ke liye)"
+        required: false
+        type: boolean
+        default: true
+      html_file:
+        description: "Offline mode: repo mein HTML file ka naam (e.g. index.html). Khali = website link se download hogi"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -32,6 +41,8 @@ jobs:
       WEBSITE_URL: ${{ inputs.website_url }}
       LOGO_URL: ${{ inputs.logo_url }}
       PACKAGE_NAME: ${{ inputs.package_name }}
+      OFFLINE_MODE: ${{ inputs.offline_mode }}
+      HTML_FILE: ${{ inputs.html_file }}
     steps:
       - uses: actions/checkout@v4
 
@@ -69,6 +80,8 @@ jobs:
           url = os.environ.get("WEBSITE_URL", "").strip()
           logo_url = os.environ.get("LOGO_URL", "").strip()
           pkg = os.environ.get("PACKAGE_NAME", "").strip().lower()
+          offline = os.environ.get("OFFLINE_MODE", "true").strip().lower() == "true"
+          html_file = os.environ.get("HTML_FILE", "").strip()
 
           if url and not re.match(r"^https?://", url, re.I):
               url = "https://" + url
@@ -183,11 +196,43 @@ jobs:
           }
           """.replace("__PKG__", pkg).replace("__COMPILE__", str(compile_sdk)).replace("__BT__", build_tools))
 
+          # ---------- Offline: HTML ko APK ke assets mein bundle karo ----------
+          start_url = url
+          if offline:
+              page = None
+              if html_file:
+                  if not os.path.isfile(html_file):
+                      sys.exit("ERROR: html_file repo mein nahi mili: " + html_file)
+                  page = open(html_file, "rb").read()
+                  print("Offline HTML (repo file):", html_file)
+              else:
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          page = r.read()
+                      print("Offline HTML (website se download):", url)
+                  except Exception as e:
+                      print("Website se HTML nahi mila ->", e)
+                      if os.path.isfile("index.html"):
+                          page = open("index.html", "rb").read()
+                          print("Offline HTML (repo ki index.html)")
+              if not page:
+                  sys.exit("ERROR: Offline mode ke liye HTML nahi mili. html_file mein file ka naam dein.")
+              w_bytes = root + "/app/src/main/assets/index.html"
+              os.makedirs(os.path.dirname(w_bytes), exist_ok=True)
+              with open(w_bytes, "wb") as f:
+                  f.write(page)
+              ext = re.findall(r"""(?:src|href)=["'](https?://[^"']+)""", page.decode("utf-8", "ignore"), re.I)
+              if ext:
+                  print("::warning::Is HTML mein external links hain, ye bina internet ke load nahi hongi:", ", ".join(sorted(set(ext))[:5]))
+              start_url = "file:///android_asset/index.html"
+
           # ---------- Manifest + strings ----------
           w(root + "/app/src/main/AndroidManifest.xml", r'''<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
               <application
@@ -372,7 +417,8 @@ jobs:
                   }
                   scheme = scheme.toLowerCase();
                   if (scheme.equals("http") || scheme.equals("https") || scheme.equals("about")
-                          || scheme.equals("javascript") || scheme.equals("data") || scheme.equals("blob")) {
+                          || scheme.equals("javascript") || scheme.equals("data") || scheme.equals("blob")
+                          || scheme.equals("file")) {
                       return false;
                   }
                   try {
@@ -450,7 +496,7 @@ jobs:
               }
           }
           '''
-          java = java.replace("__PKG__", pkg).replace("__URL__", json.dumps(url))
+          java = java.replace("__PKG__", pkg).replace("__URL__", json.dumps(start_url))
           w(root + "/app/src/main/java/" + pkg_path + "/MainActivity.java", java)
 
           # ---------- Logo -> launcher icons ----------
