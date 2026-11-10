@@ -1,0 +1,528 @@
+name: WebView APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App ka naam (e.g. My Shop)"
+        required: true
+        type: string
+      website_url:
+        description: "Website ka link (e.g. https://example.com)"
+        required: true
+        type: string
+      logo_url:
+        description: "Logo ka direct link (PNG/JPG). Khali = repo ka logo.png ya website ka favicon"
+        required: false
+        type: string
+      package_name:
+        description: "Package name (optional, e.g. com.myshop.app)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      WEBSITE_URL: ${{ inputs.website_url }}
+      LOGO_URL: ${{ inputs.logo_url }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Android project generate karo
+        run: |
+          pip install pillow
+          python3 - <<'PY'
+          import io, json, os, re, sys, urllib.request
+          from urllib.parse import urlparse
+          from xml.sax.saxutils import escape
+          from PIL import Image, ImageDraw, ImageFont
+
+          app_name = " ".join(os.environ.get("APP_NAME", "").split()) or "My App"
+          url = os.environ.get("WEBSITE_URL", "").strip()
+          logo_url = os.environ.get("LOGO_URL", "").strip()
+          pkg = os.environ.get("PACKAGE_NAME", "").strip().lower()
+
+          if url and not re.match(r"^https?://", url, re.I):
+              url = "https://" + url
+          host = urlparse(url).hostname or ""
+          if not host:
+              sys.exit("ERROR: Website ka link sahi nahi hai")
+
+          slug = re.sub(r"[^a-z0-9]+", "_", host.lower().replace("www.", "", 1)).strip("_") or "site"
+          if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", pkg):
+              pkg = "com.webapp.app_" + slug
+          apk_name = (re.sub(r"[^A-Za-z0-9]+", "-", app_name).strip("-") or slug) + ".apk"
+
+          root = "webview_project"
+          pkg_path = pkg.replace(".", "/")
+          res = root + "/app/src/main/res"
+
+          def w(path, text):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+
+          def xml_str(s):
+              s = escape(s).replace("'", "\\'").replace('"', '\\"')
+              if s[:1] in ("@", "?"):
+                  s = "\\" + s
+              return s
+
+          # ---------- Gradle files ----------
+          w(root + "/settings.gradle", r"""pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'WebViewApp'
+          include ':app'
+          """)
+
+          w(root + "/build.gradle", r"""plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          """)
+
+          w(root + "/gradle.properties", "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8\n")
+
+          w(root + "/app/build.gradle", r"""plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace '__PKG__'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId '__PKG__'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file('release.jks')
+                      storePassword 'android123'
+                      keyAlias 'key'
+                      keyPassword 'android123'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+          }
+          """.replace("__PKG__", pkg))
+
+          # ---------- Manifest + strings ----------
+          w(root + "/app/src/main/AndroidManifest.xml", r'''<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|density|uiMode"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ''')
+
+          w(res + "/values/strings.xml",
+            '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+            '    <string name="app_name" formatted="false">' + xml_str(app_name) + '</string>\n'
+            '</resources>\n')
+
+          # ---------- MainActivity ----------
+          java = r'''package __PKG__;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.DownloadManager;
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.URLUtil;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+          import android.widget.ProgressBar;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              private static final String START_URL = __URL__;
+              private static final int FILE_REQ = 1001;
+              private static final int STORAGE_REQ = 1002;
+
+              private WebView web;
+              private ProgressBar bar;
+              private ValueCallback<Uri[]> filePathCallback;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  FrameLayout root = new FrameLayout(this);
+                  web = new WebView(this);
+                  root.addView(web, new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  bar.setMax(100);
+                  bar.setVisibility(View.GONE);
+                  root.addView(bar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 10));
+                  setContentView(root);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  s.setAllowFileAccess(false);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+
+                  CookieManager cm = CookieManager.getInstance();
+                  cm.setAcceptCookie(true);
+                  cm.setAcceptThirdPartyCookies(web, true);
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          return handleUrl(request.getUrl());
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView view, String u, Bitmap favicon) {
+                          bar.setVisibility(View.VISIBLE);
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String u) {
+                          bar.setVisibility(View.GONE);
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                          if (request.isForMainFrame()) {
+                              view.loadDataWithBaseURL(null, errorHtml(request.getUrl().toString()),
+                                      "text/html", "UTF-8", null);
+                          }
+                      }
+                  });
+
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView view, int progress) {
+                          bar.setProgress(progress);
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (filePathCallback != null) {
+                              filePathCallback.onReceiveValue(null);
+                          }
+                          filePathCallback = callback;
+                          try {
+                              startActivityForResult(params.createIntent(), FILE_REQ);
+                          } catch (ActivityNotFoundException e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  web.setDownloadListener((dlUrl, userAgent, disposition, mime, length) -> {
+                      if (Build.VERSION.SDK_INT <= 28
+                              && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                              != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, STORAGE_REQ);
+                          Toast.makeText(this, "Permission allow karke download dobara karein", Toast.LENGTH_LONG).show();
+                          return;
+                      }
+                      try {
+                          DownloadManager.Request req = new DownloadManager.Request(Uri.parse(dlUrl));
+                          String cookie = CookieManager.getInstance().getCookie(dlUrl);
+                          if (cookie != null) {
+                              req.addRequestHeader("Cookie", cookie);
+                          }
+                          if (userAgent != null) {
+                              req.addRequestHeader("User-Agent", userAgent);
+                          }
+                          String fileName = URLUtil.guessFileName(dlUrl, disposition, mime);
+                          req.setMimeType(mime);
+                          req.setTitle(fileName);
+                          req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                          req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+                          ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(req);
+                          Toast.makeText(this, "Download shuru: " + fileName, Toast.LENGTH_SHORT).show();
+                      } catch (Exception e) {
+                          Toast.makeText(this, "Download nahi ho saka", Toast.LENGTH_SHORT).show();
+                      }
+                  });
+
+                  if (state != null) {
+                      web.restoreState(state);
+                  } else {
+                      web.loadUrl(START_URL);
+                  }
+              }
+
+              private boolean handleUrl(Uri uri) {
+                  String scheme = uri.getScheme();
+                  if (scheme == null) {
+                      return false;
+                  }
+                  scheme = scheme.toLowerCase();
+                  if (scheme.equals("http") || scheme.equals("https") || scheme.equals("about")
+                          || scheme.equals("javascript") || scheme.equals("data") || scheme.equals("blob")) {
+                      return false;
+                  }
+                  try {
+                      Intent intent;
+                      if (scheme.equals("intent")) {
+                          intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
+                          intent.addCategory(Intent.CATEGORY_BROWSABLE);
+                          intent.setComponent(null);
+                          intent.setSelector(null);
+                      } else {
+                          intent = new Intent(Intent.ACTION_VIEW, uri);
+                      }
+                      startActivity(intent);
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Is link ko kholne wali app nahi mili", Toast.LENGTH_SHORT).show();
+                  }
+                  return true;
+              }
+
+              private String errorHtml(String failedUrl) {
+                  String safe = failedUrl.replace("\"", "%22").replace("<", "%3C");
+                  return "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
+                          + "<body style='font-family:sans-serif;text-align:center;padding:48px 24px;color:#333'>"
+                          + "<h2>No internet connection</h2>"
+                          + "<p>Check your network and try again.</p>"
+                          + "<p><a href=\"" + safe + "\" style='display:inline-block;padding:12px 28px;"
+                          + "background:#1a73e8;color:#fff;border-radius:8px;text-decoration:none'>Retry</a></p>"
+                          + "</body></html>";
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == FILE_REQ) {
+                      if (filePathCallback != null) {
+                          filePathCallback.onReceiveValue(
+                                  WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                          filePathCallback = null;
+                      }
+                  } else {
+                      super.onActivityResult(requestCode, resultCode, data);
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) {
+                      web.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  web.saveState(outState);
+              }
+
+              @Override
+              protected void onPause() {
+                  web.onPause();
+                  super.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  web.destroy();
+                  super.onDestroy();
+              }
+          }
+          '''
+          java = java.replace("__PKG__", pkg).replace("__URL__", json.dumps(url))
+          w(root + "/app/src/main/java/" + pkg_path + "/MainActivity.java", java)
+
+          # ---------- Logo -> launcher icons ----------
+          def fetch(u):
+              req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read()
+
+          def load_logo():
+              sources = []
+              if logo_url:
+                  sources.append(("url", logo_url))
+              for f in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp"):
+                  if os.path.exists(f):
+                      sources.append(("file", f))
+              sources.append(("url", "https://www.google.com/s2/favicons?domain=" + host + "&sz=256"))
+              for kind, val in sources:
+                  try:
+                      data = fetch(val) if kind == "url" else open(val, "rb").read()
+                      im = Image.open(io.BytesIO(data))
+                      im.load()
+                      print("Logo mila:", val)
+                      return im.convert("RGBA")
+                  except Exception as e:
+                      print("Logo nahi mila:", val, "->", e)
+              return None
+
+          def placeholder():
+              im = Image.new("RGBA", (512, 512), (26, 115, 232, 255))
+              d = ImageDraw.Draw(im)
+              try:
+                  font = ImageFont.load_default(size=300)
+              except Exception:
+                  font = ImageFont.load_default()
+              try:
+                  d.text((256, 256), app_name[0].upper(), fill="white", font=font, anchor="mm")
+              except Exception:
+                  d.text((200, 200), app_name[0].upper(), fill="white", font=font)
+              return im
+
+          def make_icon(logo, size):
+              out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              mask = Image.new("L", (size, size), 0)
+              ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=int(size * 0.22), fill=255)
+              out.paste(Image.new("RGBA", (size, size), (255, 255, 255, 255)), (0, 0), mask)
+              inner = int(size * 0.72)
+              ratio = min(inner / logo.width, inner / logo.height)
+              l = logo.resize((max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))), Image.LANCZOS)
+              out.alpha_composite(l, ((size - l.width) // 2, (size - l.height) // 2))
+              return out
+
+          logo = load_logo() or placeholder()
+          for density, size in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              d = res + "/mipmap-" + density
+              os.makedirs(d, exist_ok=True)
+              make_icon(logo, size).save(d + "/ic_launcher.png")
+
+          env_file = os.environ.get("GITHUB_ENV")
+          if env_file:
+              with open(env_file, "a") as f:
+                  f.write("APK_NAME=" + apk_name + "\n")
+
+          print("Package:", pkg, "| URL:", url, "| APK:", apk_name)
+          PY
+
+      - name: Signing key banao
+        run: |
+          keytool -genkeypair -keystore webview_project/app/release.jks \
+            -alias key -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android123 -keypass android123 \
+            -dname "CN=WebApp, O=WebApp, C=US"
+
+      - name: APK build karo
+        working-directory: webview_project
+        run: gradle --no-daemon assembleRelease
+
+      - name: Download link banao
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          cp webview_project/app/build/outputs/apk/release/app-release.apk "dist/$APK_NAME"
+          TAG="apk-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "dist/$APK_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$APP_NAME" \
+            --notes "Website: $WEBSITE_URL"
+          LINK="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${APK_NAME}"
+          {
+            echo "### APK tayyar hai"
+            echo ""
+            echo "[$APK_NAME download karein]($LINK)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Download link: $LINK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*.apk
