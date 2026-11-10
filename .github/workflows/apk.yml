@@ -20,7 +20,7 @@ on:
         required: false
         type: string
       offline_mode:
-        description: "Offline mode: website APK ke andar bundle hogi, internet ki zarurat nahi (calculator jaisi single-page apps ke liye)"
+        description: "Offline mode: HTML APK ke andar bundle hogi (internet ke bina chalegi) aur internet milne par website se khud update ho jayegi"
         required: false
         type: boolean
         default: true
@@ -290,8 +290,19 @@ jobs:
           import android.widget.ProgressBar;
           import android.widget.Toast;
 
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
           public class MainActivity extends Activity {
               private static final String START_URL = __URL__;
+              private static final String REMOTE_URL = __REMOTE__;
+              private static final boolean OFFLINE = __OFFLINE__;
               private static final int FILE_REQ = 1001;
               private static final int STORAGE_REQ = 1002;
 
@@ -403,11 +414,89 @@ jobs:
                       }
                   });
 
-                  if (state != null) {
+                  if (OFFLINE) {
+                      loadOffline();
+                  } else if (state != null) {
                       web.restoreState(state);
                   } else {
                       web.loadUrl(START_URL);
                   }
+              }
+
+              private File cacheFile() {
+                  return new File(getFilesDir(), "site_cache.html");
+              }
+
+              private String readAll(InputStream in) throws IOException {
+                  ByteArrayOutputStream out = new ByteArrayOutputStream();
+                  byte[] buf = new byte[8192];
+                  int n;
+                  while ((n = in.read(buf)) > 0) {
+                      out.write(buf, 0, n);
+                      if (out.size() > 5000000) {
+                          throw new IOException("too large");
+                      }
+                  }
+                  return out.toString("UTF-8");
+              }
+
+              // Pehle cache (agar APK se nayi hai), warna APK ke andar wali HTML. Phir background mein update check.
+              private void loadOffline() {
+                  String html = null;
+                  try {
+                      File f = cacheFile();
+                      long apkTime = getPackageManager().getPackageInfo(getPackageName(), 0).lastUpdateTime;
+                      if (f.exists() && f.lastModified() > apkTime) {
+                          try (InputStream in = new FileInputStream(f)) {
+                              html = readAll(in);
+                          }
+                      }
+                  } catch (Exception e) {
+                      html = null;
+                  }
+                  if (html == null || html.isEmpty()) {
+                      try (InputStream in = getAssets().open("index.html")) {
+                          html = readAll(in);
+                      } catch (Exception e) {
+                          html = "<h2>Load error</h2>";
+                      }
+                  }
+                  web.loadDataWithBaseURL(REMOTE_URL, html, "text/html", "UTF-8", null);
+                  checkForUpdate(html);
+              }
+
+              // Internet ho to nayi HTML download karke cache mein rakho; agli baar app kholne par chalegi.
+              private void checkForUpdate(final String current) {
+                  new Thread(() -> {
+                      try {
+                          String u = REMOTE_URL + (REMOTE_URL.contains("?") ? "&" : "?") + "t=" + System.currentTimeMillis();
+                          HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                          c.setConnectTimeout(8000);
+                          c.setReadTimeout(8000);
+                          c.setRequestProperty("Cache-Control", "no-cache");
+                          c.setRequestProperty("User-Agent", "Mozilla/5.0");
+                          if (c.getResponseCode() != 200) {
+                              return;
+                          }
+                          String fresh;
+                          try (InputStream in = c.getInputStream()) {
+                              fresh = readAll(in);
+                          }
+                          if (fresh.length() < 50 || !fresh.toLowerCase().contains("</html>") || fresh.equals(current)) {
+                              return;
+                          }
+                          File tmp = new File(getFilesDir(), "site_cache.tmp");
+                          try (FileOutputStream o = new FileOutputStream(tmp)) {
+                              o.write(fresh.getBytes("UTF-8"));
+                          }
+                          File f = cacheFile();
+                          if (!tmp.renameTo(f)) {
+                              f.delete();
+                              tmp.renameTo(f);
+                          }
+                      } catch (Exception ignored) {
+                      }
+                  }).start();
               }
 
               private boolean handleUrl(Uri uri) {
@@ -496,7 +585,7 @@ jobs:
               }
           }
           '''
-          java = java.replace("__PKG__", pkg).replace("__URL__", json.dumps(start_url))
+          java = java.replace("__PKG__", pkg).replace("__URL__", json.dumps(start_url)).replace("__REMOTE__", json.dumps(url)).replace("__OFFLINE__", "true" if offline else "false")
           w(root + "/app/src/main/java/" + pkg_path + "/MainActivity.java", java)
 
           # ---------- Logo -> launcher icons ----------
